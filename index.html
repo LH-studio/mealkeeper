@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="MealKeeper">
+  <meta name="theme-color" content="#059669">
+  <meta name="description" content="Gekochte Gerichte tracken und Lebensmittelverschwendung vermeiden">
+  <title>MealKeeper</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root {
+      height: 100%;
+      font-family: 'DM Sans', 'Helvetica Neue', -apple-system, sans-serif;
+      background: #FAFAF9;
+      color: #1a1a1a;
+      -webkit-font-smoothing: antialiased;
+      -webkit-tap-highlight-color: transparent;
+      overscroll-behavior: none;
+    }
+    body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+    @keyframes toastIn {
+      from { opacity: 0; transform: translateX(-50%) translateY(12px); }
+      to { opacity: 1; transform: translateX(-50%) translateY(0); }
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    input[type="date"]::-webkit-date-and-time-value { text-align: left; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const STORAGE_KEY = "mealkeeper-dishes";
+    const REMINDER_KEY = "mealkeeper-reminders";
+    const MAX_DISHES = 30;
+
+    // ── Storage helpers (localStorage) ──
+    const storage = {
+      get(key) {
+        try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; }
+        catch { return null; }
+      },
+      set(key, value) {
+        try { localStorage.setItem(key, JSON.stringify(value)); } catch { /**/ }
+      }
+    };
+
+    // ── Date helpers ──
+    const formatDate = (dateStr) => {
+      if (!dateStr) return "";
+      const d = new Date(dateStr + "T00:00:00");
+      const days = ["So","Mo","Di","Mi","Do","Fr","Sa"];
+      const months = ["Jan","Feb","Mär","Apr","Mai","Jun","Jul","Aug","Sep","Okt","Nov","Dez"];
+      return `${days[d.getDay()]}, ${d.getDate()}. ${months[d.getMonth()]} ${d.getFullYear()}`;
+    };
+
+    const getDaysRemaining = (expiryDate) => {
+      const today = new Date(); today.setHours(0,0,0,0);
+      const expiry = new Date(expiryDate + "T00:00:00"); expiry.setHours(0,0,0,0);
+      return Math.ceil((expiry - today) / (1000*60*60*24));
+    };
+
+    const getStatusColor = (days) => {
+      if (days < 0)  return { bg:"#FEE2E2", text:"#DC2626", label:"Abgelaufen" };
+      if (days === 0) return { bg:"#FEF3C7", text:"#D97706", label:"Heute" };
+      if (days <= 2)  return { bg:"#FEF9C3", text:"#CA8A04", label:`${days} Tag${days>1?"e":""}` };
+      return { bg:"#ECFDF5", text:"#059669", label:`${days} Tage` };
+    };
+
+    const getTodayStr = () => new Date().toISOString().split("T")[0];
+    const getDefaultExpiry = () => { const d = new Date(); d.setDate(d.getDate()+3); return d.toISOString().split("T")[0]; };
+
+    // ── Calendar (.ics) ──
+    const generateICS = (dish) => {
+      const expiry = dish.expiryDate.replace(/-/g,"");
+      const now = new Date().toISOString().replace(/[-:]/g,"").split(".")[0]+"Z";
+      const nd = new Date(dish.expiryDate+"T00:00:00"); nd.setDate(nd.getDate()+1);
+      const endStr = nd.toISOString().split("T")[0].replace(/-/g,"");
+      return [
+        "BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//MealKeeper//DE",
+        "BEGIN:VEVENT",
+        `DTSTART;VALUE=DATE:${expiry}`,`DTEND;VALUE=DATE:${endStr}`,
+        `SUMMARY:🍽️ ${dish.name} aufbrauchen!`,
+        `DESCRIPTION:Dein Gericht „${dish.name}" laeuft heute ab. Jetzt essen oder einfrieren!`,
+        "BEGIN:VALARM","TRIGGER:-PT0M","ACTION:DISPLAY",
+        `DESCRIPTION:${dish.name} laeuft heute ab!`,"END:VALARM",
+        "BEGIN:VALARM","TRIGGER:-PT12H","ACTION:DISPLAY",
+        `DESCRIPTION:${dish.name} laeuft morgen ab!`,"END:VALARM",
+        `DTSTAMP:${now}`,`UID:mealkeeper-${dish.id}@app`,
+        "END:VEVENT","END:VCALENDAR"
+      ].join("\r\n");
+    };
+
+    const downloadICS = (dish) => {
+      const blob = new Blob([generateICS(dish)], { type:"text/calendar;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${dish.name.replace(/[^a-zA-Z0-9äöüÄÖÜß ]/g,"").replace(/ /g,"_")}_erinnerung.ics`;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a); URL.revokeObjectURL(url);
+    };
+
+    // ── Icons ──
+    const PlusIcon = () => React.createElement("svg",{width:22,height:22,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2.5,strokeLinecap:"round"},
+      React.createElement("line",{x1:12,y1:5,x2:12,y2:19}),React.createElement("line",{x1:5,y1:12,x2:19,y2:12}));
+    const TrashIcon = () => React.createElement("svg",{width:18,height:18,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round"},
+      React.createElement("polyline",{points:"3 6 5 6 21 6"}),React.createElement("path",{d:"M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"}));
+    const EditIcon = () => React.createElement("svg",{width:18,height:18,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round"},
+      React.createElement("path",{d:"M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"}),React.createElement("path",{d:"M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"}));
+    const BackIcon = () => React.createElement("svg",{width:22,height:22,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2.5,strokeLinecap:"round"},
+      React.createElement("line",{x1:19,y1:12,x2:5,y2:12}),React.createElement("polyline",{points:"12 19 5 12 12 5"}));
+    const CameraIcon = () => React.createElement("svg",{width:32,height:32,viewBox:"0 0 24 24",fill:"none",stroke:"#94a3b8",strokeWidth:1.5,strokeLinecap:"round"},
+      React.createElement("path",{d:"M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"}),React.createElement("circle",{cx:12,cy:13,r:4}));
+    const BellIcon = () => React.createElement("svg",{width:18,height:18,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round"},
+      React.createElement("path",{d:"M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"}),React.createElement("path",{d:"M13.73 21a2 2 0 0 1-3.46 0"}));
+    const LeafIcon = () => React.createElement("svg",{width:20,height:20,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round"},
+      React.createElement("path",{d:"M17 8C8 10 5.9 16.17 3.82 21.34l1.89.66.95-2.3c.48.17.98.3 1.34.3C19 20 22 3 22 3c-1 2-8 2.25-13 3.25S2 11.5 2 13.5s1.75 3.75 1.75 3.75"}));
+    const CalCheckIcon = () => React.createElement("svg",{width:16,height:16,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2.5,strokeLinecap:"round"},
+      React.createElement("polyline",{points:"20 6 9 17 4 12"}));
+
+    // ── Main App ──
+    function MealKeeper() {
+      const [dishes, setDishes] = useState(() => storage.get(STORAGE_KEY) || []);
+      const [view, setView] = useState("list");
+      const [selectedDish, setSelectedDish] = useState(null);
+      const [deleteConfirm, setDeleteConfirm] = useState(null);
+      const [reminderSet, setReminderSet] = useState(() => new Set(storage.get(REMINDER_KEY) || []));
+      const [toast, setToast] = useState(null);
+      const fileInputRef = useRef(null);
+      const [form, setForm] = useState({ name:"", photo:null, cookDate:getTodayStr(), expiryDate:getDefaultExpiry() });
+
+      useEffect(() => { if (toast) { const t = setTimeout(()=>setToast(null),2800); return ()=>clearTimeout(t); } }, [toast]);
+
+      const saveDishes = (nd) => { const sorted = [...nd].sort((a,b)=>new Date(a.expiryDate)-new Date(b.expiryDate)); setDishes(sorted); storage.set(STORAGE_KEY, sorted); return sorted; };
+      const saveReminder = (id) => { const next = new Set(reminderSet); next.add(id); setReminderSet(next); storage.set(REMINDER_KEY, [...next]); };
+      const hasReminder = (id) => reminderSet.has(id);
+
+      const handlePhotoCapture = (e) => {
+        const file = e.target.files[0]; if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          const img = new Image();
+          img.onload = () => {
+            const canvas = document.createElement("canvas");
+            const scale = Math.min(1, 600/img.width);
+            canvas.width = img.width*scale; canvas.height = img.height*scale;
+            canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+            setForm(f => ({...f, photo: canvas.toDataURL("image/jpeg", 0.7)}));
+          };
+          img.src = ev.target.result;
+        };
+        reader.readAsDataURL(file);
+      };
+
+      const resetForm = () => setForm({ name:"", photo:null, cookDate:getTodayStr(), expiryDate:getDefaultExpiry() });
+
+      const handleSave = () => {
+        if (!form.name.trim()) return;
+        const newDish = { id: Date.now().toString(), name: form.name.trim(), photo: form.photo, cookDate: form.cookDate, expiryDate: form.expiryDate };
+        saveDishes([...dishes, newDish]);
+        resetForm(); setView("list");
+      };
+
+      const handleUpdate = () => {
+        if (!form.name.trim() || !selectedDish) return;
+        const updated = saveDishes(dishes.map(d => d.id === selectedDish.id ? {...d, name:form.name.trim(), photo:form.photo, cookDate:form.cookDate, expiryDate:form.expiryDate} : d));
+        setSelectedDish(updated.find(d => d.id === selectedDish.id));
+        setView("detail");
+      };
+
+      const handleDelete = (id) => { saveDishes(dishes.filter(d => d.id !== id)); setDeleteConfirm(null); if (view==="detail") setView("list"); };
+      const handleReminder = (dish) => { downloadICS(dish); saveReminder(dish.id); setToast(`Erinnerung für „${dish.name}" erstellt`); };
+      const openDetail = (dish) => { setSelectedDish(dish); setView("detail"); };
+      const openEdit = () => { setForm({ name:selectedDish.name, photo:selectedDish.photo, cookDate:selectedDish.cookDate, expiryDate:selectedDish.expiryDate }); setView("edit"); };
+      const openCreate = () => { resetForm(); setView("create"); };
+
+      // ── Styles ──
+      const s = {
+        app:{maxWidth:430,margin:"0 auto",minHeight:"100vh",background:"#FAFAF9",position:"relative"},
+        header:{padding:"20px 20px 12px",display:"flex",alignItems:"center",justifyContent:"space-between",borderBottom:"1px solid #f0eeeb",background:"#fff",position:"sticky",top:0,zIndex:10},
+        headerTitle:{fontSize:20,fontWeight:700,letterSpacing:"-0.3px",display:"flex",alignItems:"center",gap:8},
+        headerSub:{fontSize:12,color:"#94a3b8",fontWeight:400,marginTop:2},
+        addBtn:{width:42,height:42,borderRadius:14,background:"#1a1a1a",color:"#fff",border:"none",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer"},
+        list:{padding:"12px 16px 100px",display:"flex",flexDirection:"column",gap:10},
+        card:{background:"#fff",borderRadius:16,padding:14,display:"flex",alignItems:"center",gap:14,cursor:"pointer",border:"1px solid #f0eeeb"},
+        cardThumb:{width:56,height:56,borderRadius:12,objectFit:"cover",flexShrink:0,background:"#f5f4f1"},
+        cardNoThumb:{width:56,height:56,borderRadius:12,flexShrink:0,background:"#f5f4f1",display:"flex",alignItems:"center",justifyContent:"center"},
+        cardInfo:{flex:1,minWidth:0},
+        cardName:{fontSize:15,fontWeight:600,letterSpacing:"-0.2px",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"},
+        cardDate:{fontSize:12,color:"#94a3b8",marginTop:3},
+        badge:{padding:"5px 10px",borderRadius:20,fontSize:12,fontWeight:600,whiteSpace:"nowrap",flexShrink:0},
+        formWrap:{padding:"16px 20px 40px"},
+        formSection:{marginBottom:20},
+        label:{fontSize:13,fontWeight:600,color:"#64748b",marginBottom:8,display:"block",letterSpacing:"0.3px",textTransform:"uppercase"},
+        input:{width:"100%",padding:"14px 16px",borderRadius:14,border:"1.5px solid #e8e6e3",fontSize:16,fontFamily:"inherit",background:"#fff",color:"#1a1a1a",outline:"none",boxSizing:"border-box"},
+        dateInput:{width:"100%",padding:"14px 16px",borderRadius:14,border:"1.5px solid #e8e6e3",fontSize:16,fontFamily:"inherit",background:"#fff",color:"#1a1a1a",outline:"none",boxSizing:"border-box",WebkitAppearance:"none"},
+        photoArea:{width:"100%",height:200,borderRadius:16,border:"2px dashed #ddd9d4",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",cursor:"pointer",background:"#fff",overflow:"hidden"},
+        photoPreview:{width:"100%",height:"100%",objectFit:"cover"},
+        primaryBtn:{width:"100%",padding:16,borderRadius:14,background:"#1a1a1a",color:"#fff",border:"none",fontSize:16,fontWeight:600,fontFamily:"inherit",cursor:"pointer"},
+        primaryBtnDisabled:{opacity:0.35,cursor:"not-allowed"},
+        secondaryBtn:{padding:"10px 18px",borderRadius:12,background:"transparent",color:"#1a1a1a",border:"1.5px solid #e8e6e3",fontSize:14,fontWeight:600,fontFamily:"inherit",cursor:"pointer",display:"inline-flex",alignItems:"center",gap:6},
+        backBtn:{width:42,height:42,borderRadius:14,background:"#f5f4f1",border:"none",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer"},
+        deleteBtn:{padding:5,background:"none",border:"none",color:"#DC2626",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",borderRadius:8,flexShrink:0},
+        detailPhoto:{width:"100%",height:260,objectFit:"cover",background:"#f5f4f1"},
+        detailNoPhoto:{width:"100%",height:180,background:"#f5f4f1",display:"flex",alignItems:"center",justifyContent:"center"},
+        detailContent:{padding:"20px 20px 40px"},
+        detailName:{fontSize:26,fontWeight:700,letterSpacing:"-0.5px",marginBottom:16},
+        detailRow:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 0",borderBottom:"1px solid #f0eeeb"},
+        detailLabel:{fontSize:13,color:"#94a3b8",fontWeight:500},
+        detailValue:{fontSize:15,fontWeight:600,textAlign:"right"},
+        detailActions:{display:"flex",gap:10,marginTop:28},
+        overlay:{position:"fixed",inset:0,background:"rgba(0,0,0,0.3)",backdropFilter:"blur(4px)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:20},
+        modal:{background:"#fff",borderRadius:20,padding:"28px 24px 20px",maxWidth:320,width:"100%",textAlign:"center"},
+        toast:{position:"fixed",bottom:32,left:"50%",transform:"translateX(-50%)",background:"#1a1a1a",color:"#fff",padding:"12px 24px",borderRadius:14,fontSize:14,fontWeight:600,zIndex:200,boxShadow:"0 8px 32px rgba(0,0,0,0.18)",whiteSpace:"nowrap",animation:"toastIn 0.3s ease"},
+        reminderBtn:{padding:"12px 18px",borderRadius:12,background:"#059669",color:"#fff",border:"none",fontSize:14,fontWeight:600,fontFamily:"inherit",cursor:"pointer",display:"inline-flex",alignItems:"center",gap:8,width:"100%",justifyContent:"center"},
+        reminderDone:{padding:"12px 18px",borderRadius:12,background:"#ECFDF5",color:"#059669",border:"1.5px solid #A7F3D0",fontSize:14,fontWeight:600,fontFamily:"inherit",cursor:"default",display:"inline-flex",alignItems:"center",gap:8,width:"100%",justifyContent:"center"},
+        empty:{textAlign:"center",padding:"80px 40px",color:"#94a3b8"},
+        emptyTitle:{fontSize:18,fontWeight:600,color:"#64748b",marginBottom:8},
+      };
+
+      // ── Delete Modal ──
+      const DeleteModal = ({name, onCancel, onDelete}) => (
+        <div style={s.overlay} onClick={onCancel}>
+          <div style={s.modal} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:36,marginBottom:12}}>🗑️</div>
+            <div style={{fontSize:17,fontWeight:700,marginBottom:6}}>Gericht löschen?</div>
+            <div style={{fontSize:14,color:"#64748b",marginBottom:24}}>„{name}" wird unwiderruflich entfernt.</div>
+            <div style={{display:"flex",gap:10}}>
+              <button style={{...s.secondaryBtn,flex:1,justifyContent:"center"}} onClick={onCancel}>Abbrechen</button>
+              <button style={{...s.primaryBtn,flex:1,background:"#DC2626"}} onClick={onDelete}>Löschen</button>
+            </div>
+          </div>
+        </div>
+      );
+
+      // ═══════════ LIST VIEW ═══════════
+      if (view === "list") {
+        return (
+          <div style={s.app}>
+            <div style={s.header}>
+              <div>
+                <div style={s.headerTitle}><span style={{color:"#059669"}}><LeafIcon/></span> MealKeeper</div>
+                <div style={s.headerSub}>{dishes.length} von {MAX_DISHES} Gerichten</div>
+              </div>
+              {dishes.length < MAX_DISHES && <button style={s.addBtn} onClick={openCreate}><PlusIcon/></button>}
+            </div>
+
+            {dishes.length === 0 ? (
+              <div style={s.empty}>
+                <div style={{fontSize:48,marginBottom:16}}>🥗</div>
+                <div style={s.emptyTitle}>Noch keine Gerichte</div>
+                <div style={{fontSize:14,lineHeight:1.5}}>Tippe auf <strong>+</strong> um dein erstes<br/>gekochtes Gericht hinzuzufügen.</div>
+              </div>
+            ) : (
+              <div style={s.list}>
+                {dishes.map(dish => {
+                  const days = getDaysRemaining(dish.expiryDate);
+                  const status = getStatusColor(days);
+                  return (
+                    <div key={dish.id} style={s.card} onClick={()=>openDetail(dish)}>
+                      {dish.photo
+                        ? <img src={dish.photo} alt="" style={s.cardThumb}/>
+                        : <div style={s.cardNoThumb}><span style={{fontSize:24}}>🍽️</span></div>}
+                      <div style={s.cardInfo}>
+                        <div style={s.cardName}>{dish.name}</div>
+                        <div style={s.cardDate}>
+                          Haltbar bis {formatDate(dish.expiryDate)}
+                          {hasReminder(dish.id) && <span style={{marginLeft:6}}>🔔</span>}
+                        </div>
+                      </div>
+                      <div style={{...s.badge,background:status.bg,color:status.text}}>{status.label}</div>
+                      <button style={s.deleteBtn} onClick={e=>{e.stopPropagation();setDeleteConfirm(dish.id);}}><TrashIcon/></button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {deleteConfirm && <DeleteModal
+              name={dishes.find(d=>d.id===deleteConfirm)?.name || ""}
+              onCancel={()=>setDeleteConfirm(null)}
+              onDelete={()=>handleDelete(deleteConfirm)}
+            />}
+            {toast && <div style={s.toast}>{toast}</div>}
+          </div>
+        );
+      }
+
+      // ═══════════ CREATE / EDIT VIEW ═══════════
+      if (view === "create" || view === "edit") {
+        const isEdit = view === "edit";
+        const canSave = form.name.trim().length > 0;
+        return (
+          <div style={s.app}>
+            <div style={s.header}>
+              <button style={s.backBtn} onClick={()=>{resetForm();setView(isEdit?"detail":"list");}}><BackIcon/></button>
+              <div style={{fontSize:17,fontWeight:700}}>{isEdit ? "Bearbeiten" : "Neues Gericht"}</div>
+              <div style={{width:42}}/>
+            </div>
+            <div style={s.formWrap}>
+              {/* Photo */}
+              <div style={s.formSection}>
+                <label style={s.label}>Foto</label>
+                <input ref={fileInputRef} type="file" accept="image/*" capture="environment" onChange={handlePhotoCapture} style={{display:"none"}}/>
+                <div style={s.photoArea} onClick={()=>fileInputRef.current?.click()}>
+                  {form.photo
+                    ? <img src={form.photo} alt="" style={s.photoPreview}/>
+                    : <><CameraIcon/><div style={{fontSize:14,color:"#94a3b8",marginTop:8}}>Tippen zum Fotografieren</div></>}
+                </div>
+                {form.photo && <button style={{...s.secondaryBtn,marginTop:10,fontSize:13}} onClick={()=>setForm(f=>({...f,photo:null}))}>Foto entfernen</button>}
+              </div>
+              {/* Name */}
+              <div style={s.formSection}>
+                <label style={s.label}>Name des Gerichts</label>
+                <input type="text" style={s.input} placeholder="z.B. Bolognese, Curry, Suppe…" value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} maxLength={60}/>
+              </div>
+              {/* Cook Date */}
+              <div style={s.formSection}>
+                <label style={s.label}>Kochdatum</label>
+                <input type="date" style={s.dateInput} value={form.cookDate} onChange={e=>setForm(f=>({...f,cookDate:e.target.value}))}/>
+                {form.cookDate && <div style={{fontSize:13,color:"#94a3b8",marginTop:6}}>{formatDate(form.cookDate)}</div>}
+              </div>
+              {/* Expiry Date */}
+              <div style={s.formSection}>
+                <label style={s.label}>Haltbar bis</label>
+                <input type="date" style={s.dateInput} value={form.expiryDate} onChange={e=>setForm(f=>({...f,expiryDate:e.target.value}))}/>
+                {form.expiryDate && (
+                  <div style={{fontSize:13,color:"#94a3b8",marginTop:6}}>
+                    {formatDate(form.expiryDate)} · {(()=>{ const d=getDaysRemaining(form.expiryDate); const st=getStatusColor(d); return <span style={{color:st.text,fontWeight:600}}>{st.label}</span>; })()}
+                  </div>
+                )}
+              </div>
+              <button style={{...s.primaryBtn,...(canSave?{}:s.primaryBtnDisabled),marginTop:8}} onClick={isEdit?handleUpdate:handleSave} disabled={!canSave}>
+                {isEdit ? "Änderungen speichern" : "Gericht speichern"}
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      // ═══════════ DETAIL VIEW ═══════════
+      if (view === "detail" && selectedDish) {
+        const days = getDaysRemaining(selectedDish.expiryDate);
+        const status = getStatusColor(days);
+        const reminded = hasReminder(selectedDish.id);
+        return (
+          <div style={s.app}>
+            <div style={{...s.header,background:"rgba(255,255,255,0.85)",backdropFilter:"blur(12px)"}}>
+              <button style={s.backBtn} onClick={()=>setView("list")}><BackIcon/></button>
+              <div style={{fontSize:17,fontWeight:700}}>Detail</div>
+              <div style={{width:42}}/>
+            </div>
+
+            {selectedDish.photo
+              ? <img src={selectedDish.photo} alt={selectedDish.name} style={s.detailPhoto}/>
+              : <div style={s.detailNoPhoto}><span style={{fontSize:56}}>🍽️</span></div>}
+
+            <div style={s.detailContent}>
+              <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:8}}>
+                <div style={s.detailName}>{selectedDish.name}</div>
+                <div style={{...s.badge,background:status.bg,color:status.text,marginTop:6}}>{status.label}</div>
+              </div>
+
+              <div style={s.detailRow}>
+                <div style={s.detailLabel}>Gekocht am</div>
+                <div style={s.detailValue}>{formatDate(selectedDish.cookDate)}</div>
+              </div>
+              <div style={s.detailRow}>
+                <div style={s.detailLabel}>Haltbar bis</div>
+                <div style={{...s.detailValue,color:status.text}}>{formatDate(selectedDish.expiryDate)}</div>
+              </div>
+              <div style={{...s.detailRow,borderBottom:"none"}}>
+                <div style={s.detailLabel}>Verbleibend</div>
+                <div style={{...s.detailValue,color:status.text}}>
+                  {days<0 ? `${Math.abs(days)} Tag${Math.abs(days)>1?"e":""} überschritten` : days===0 ? "Heute aufbrauchen!" : `${days} Tag${days>1?"e":""}`}
+                </div>
+              </div>
+
+              {/* Reminder */}
+              {days > 0 && (
+                <div style={{marginTop:24,padding:20,background:"#fff",borderRadius:16,border:"1px solid #f0eeeb"}}>
+                  <div style={{fontSize:13,fontWeight:600,color:"#64748b",marginBottom:12,textTransform:"uppercase",letterSpacing:"0.3px"}}>Erinnerung</div>
+                  {reminded
+                    ? <button style={s.reminderDone} disabled><CalCheckIcon/> Erinnerung im Kalender gesetzt</button>
+                    : <button style={s.reminderBtn} onClick={()=>handleReminder(selectedDish)}><BellIcon/> An Ablauftag erinnern</button>}
+                  <div style={{fontSize:12,color:"#94a3b8",marginTop:10,textAlign:"center",lineHeight:1.4}}>
+                    {reminded ? "Du bekommst am Ablauftag eine Benachrichtigung über deinen Kalender." : "Erstellt einen Kalendereintrag mit zwei Erinnerungen: 12h vorher und am Ablauftag."}
+                  </div>
+                </div>
+              )}
+
+              <div style={s.detailActions}>
+                <button style={{...s.secondaryBtn,flex:1,justifyContent:"center"}} onClick={openEdit}><EditIcon/> Bearbeiten</button>
+                <button style={{...s.secondaryBtn,flex:1,justifyContent:"center",borderColor:"#FECACA",color:"#DC2626"}} onClick={()=>setDeleteConfirm(selectedDish.id)}><TrashIcon/> Löschen</button>
+              </div>
+            </div>
+
+            {deleteConfirm && <DeleteModal
+              name={selectedDish.name}
+              onCancel={()=>setDeleteConfirm(null)}
+              onDelete={()=>handleDelete(deleteConfirm)}
+            />}
+            {toast && <div style={s.toast}>{toast}</div>}
+          </div>
+        );
+      }
+
+      return null;
+    }
+
+    // ── Render ──
+    ReactDOM.createRoot(document.getElementById("root")).render(<MealKeeper/>);
+  </script>
+
+  <script>
+    // Register Service Worker
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js')
+          .then(reg => console.log('SW registered:', reg.scope))
+          .catch(err => console.log('SW registration failed:', err));
+      });
+    }
+  </script>
+</body>
+</html>
